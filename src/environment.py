@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-
+from tqdm import tqdm
 
 class Environment:
     def __init__(self, dataset, interactor, init_bankroll=1000, min_bet=5, max_bet=100):
@@ -29,12 +29,12 @@ class Environment:
         opps = opps[opps[self.odds_cols].sum(axis=1) > 0]
         return opps.drop(self.label_cols, axis=1)
 
-    def run(self, start=None, end=None):
+    def run(self, start=None, end=None, verbose=False):
         start = start if start is not None else self.dataset.Open.min()
         end = end if end is not None else self.dataset.Date.max()
 
         print(f"Start: {start}, End: {end}")
-        for date in pd.date_range(start, end):
+        for date in tqdm(pd.date_range(start, end)):
 
             opps = self.get_opps(date)
             if opps.empty:
@@ -47,7 +47,8 @@ class Environment:
             self.bankroll += self.evaluate_bets(inc)
 
             summary = self.generate_summary(date)
-            print(f'{date:%Y-%m-%d}: available: {self.bankroll:.2f}, invested {placed:.2f}, total {self.bankroll+placed:.2f}')
+            if verbose:
+                print(f'{date:%Y-%m-%d}: available: {self.bankroll:.2f}, invested {placed:.2f}, total {self.bankroll+placed:.2f}')
 
             bets = self.get_bets(summary, inc, opps)
 
