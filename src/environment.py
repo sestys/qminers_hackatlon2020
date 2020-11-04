@@ -58,6 +58,7 @@ class Environment:
 
         self.bankroll += self.evaluate_bets(self.get_incremental_data(end + pd.to_timedelta(1, 'days')))
 
+        self.interactor.print_leagues()
         if hasattr(self.interactor, 'writeln'):
             self.send_updates(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
