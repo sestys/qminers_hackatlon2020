@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 from math import log
 from typing import List, Dict
 from tqdm import tqdm
@@ -195,11 +195,11 @@ class Model:
                 best_validation = avg_eval
                 self.model = deepcopy(model)
 
-        if plot:
-            plt.plot(epoch_loss)
-            plt.plot(validation_loss)
-            plt.legend(['train', 'validation'])
-            plt.show()
+        # if plot:
+        #     plt.plot(epoch_loss)
+        #     plt.plot(validation_loss)
+        #     plt.legend(['train', 'validation'])
+        #     plt.show()
 
     def update_bankroll(self, curr):
         self.bankroll = curr
@@ -212,7 +212,7 @@ class Model:
             data = np.array(self.train_data, dtype=float)
             labels = np.array(data[:, 1], dtype=int)
             data = data[:, 0].reshape(-1, 1)
-            self.train_predictor(data=data, labels=labels, plot=True)
+            self.train_predictor(data=data, labels=labels, plot=False)
             self.model.eval()
             self.train = False
         _summary = summary.iloc[0].to_dict()
@@ -278,8 +278,8 @@ class Model:
                 self.train_data.append([gd, winner])
 
     def print_leagues(self):
-        plt.hist(self.diffs)
-        plt.show()
+        # plt.hist(self.diffs)
+        # plt.show()
         print(self.bankroll_variance)
         for _, league in self.leagues.items():
             print(league)
