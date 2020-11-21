@@ -33,7 +33,7 @@ class Environment:
         start = start if start is not None else self.dataset.Open.min()
         end = end if end is not None else self.dataset.Date.max()
 
-        print(f"Start: {start}, End: {end}")
+        # print(f"Start: {start}, End: {end}")
         for date in tqdm(pd.date_range(start, end)):
 
             opps = self.get_opps(date)

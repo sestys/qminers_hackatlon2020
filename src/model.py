@@ -136,7 +136,7 @@ class League:
 
 class Model:
     def __init__(self):
-        self.bankroll: float = 0.0
+        self.bankroll: List[float] = []
         self.bankroll_variance = [float('inf'), float('-inf')]
         self.leagues: Dict[str, League] = {}
         self.data: pd.DataFrame = pd.DataFrame()
@@ -163,7 +163,7 @@ class Model:
         validation_loss = np.zeros(m_epochs)
         best_validation = float('inf')
         model.to(device)
-        for epoch in tqdm(range(m_epochs)):
+        for epoch in range(m_epochs):
             avg_epoch = 0.
             model.train()
             for x, y in train_loader:
@@ -202,9 +202,28 @@ class Model:
         #     plt.show()
 
     def update_bankroll(self, curr):
-        self.bankroll = curr
-        self.bankroll_variance[0] = min(self.bankroll_variance[0], self.bankroll)
-        self.bankroll_variance[1] = max(self.bankroll_variance[1], self.bankroll)
+        self.bankroll.append(curr)
+        self.bankroll_variance[0] = min(self.bankroll_variance[0], curr)
+        self.bankroll_variance[1] = max(self.bankroll_variance[1], curr)
+
+    def predict_model(self, goal_diff):
+        inp = np.zeros((1, 1))
+        inp[0, 0] = goal_diff
+        inp = torch.tensor(inp, dtype=float)
+        inp.to(device)
+        pred_prob = F.softmax(self.model(inp), dim=1).cpu().detach().numpy()
+        return pred_prob[0, [1, 0, 2]]
+
+    def compute_bet(self, p_prob, b_prob, min_bet, max_bet):
+        diff = p_prob - b_prob
+        dif_idx = np.argmax(diff)
+        dif_max = np.max(diff)
+        self.diffs.append(dif_max)
+        if dif_max < 0.05:
+            bet = 0
+        else:
+            bet = max(min_bet, min(max_bet, self.bankroll[-1] / 100))
+        return bet, dif_idx
 
     def place_bets(self, opps: pd.DataFrame, summary: pd.DataFrame, inc: pd.DataFrame):
         self.update_data(inc)
@@ -225,41 +244,15 @@ class Model:
         bets = np.zeros((N, 3))
         for i in range(N):
             game = today_games.iloc[i]
-            bet = max(min_bet, min(max_bet, self.bankroll / 100))
             if game['LID'] not in self.leagues or self.leagues[game['LID']].n_games < 1000:
                 continue
             league = self.leagues[game['LID']]
-            pred_outcome = league.predict_match_outcome(game['HID'], game['AID'])
-            diff = pred_outcome
-            inp = np.zeros((1, 1))
-            inp[0, 0] = diff
-            inp = torch.tensor(inp, dtype=float)
-            inp.to(device)
-            pred_prob = F.softmax(self.model(inp), dim=1).cpu().detach().numpy()
-            pred_prob = pred_prob[0, [1, 0, 2]]
-            odds = game[self.odds_cols].to_numpy()
-            b_prob = odds2prob(odds)
-            diff = pred_prob - b_prob
-            dif_idx = np.argmax(diff)
-            dif_max = np.max(diff)
-            self.diffs.append(dif_max)
-            if dif_max < 0.05:
-                bet = 0
-            else:
-                bet += 0
-            # if diff > 1.:  # win home
-            #     odds = 0
-            # elif diff < -1.3:  # win away
-            #     odds = 2
-            # elif -0.4 < diff < 0.5:
-            #     odds = 1
-            # else:
-            #     odds = 0
-            #     bet = 0
+            p_prob = self.predict_model(league.predict_match_outcome(game['HID'], game['AID']))
+            b_prob = odds2prob(game[self.odds_cols].to_numpy())
 
-            bets[i, dif_idx] = bet
-        if VERBOSE:
-            print('Opportunities: {}'.format(N))
+            bet, idx = self.compute_bet(p_prob, b_prob, min_bet, max_bet)
+            bets[i, idx] = bet
+
         return pd.DataFrame(data=bets, columns=['BetH', 'BetD', 'BetA'], index=today_games.index)
 
     def update_data(self, inc: pd.DataFrame):
@@ -278,13 +271,13 @@ class Model:
                 self.train_data.append([gd, winner])
 
     def print_leagues(self):
-        # plt.hist(self.diffs)
-        # plt.show()
         print(self.bankroll_variance)
-        for _, league in self.leagues.items():
-            print(league)
+        try:
+            import matplotlib.pyplot as plt
+            plt.plot(self.bankroll)
+            plt.show()
+            plt.hist(self.diffs)
+            plt.show()
+        except Exception:
+            pass
 
-if __name__ == "__main__":
-    odd = np.array([3.1, 2.2, 1.1])
-    prob = odds2prob(odd)
-    print(prob)
