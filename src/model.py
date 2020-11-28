@@ -12,10 +12,18 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
 VERBOSE = False
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+RETRAIN_MODELS = False
+PI_GAME_LIMIT = 10
+DIFF_TRESHOLD = 0.05
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-res_cols = ['H', 'D', 'A']
-
+RES_COLS = ['H', 'D', 'A']
+ODDS_COLS = ['OddsH', 'OddsD', 'OddsA']
+SCORE_COLS = ['HSC', 'ASC']
+TEAM_COLS = ['HID', 'AID']
+MODEL_COL = ['H_HRTG', 'H_ARTG', 'A_HRTG', 'A_ARTG', 'EGD']
+LEAGUE_DATA = ['Sea'] + TEAM_COLS + SCORE_COLS + RES_COLS + MODEL_COL + ['UFT']
+LEAGUE_DATA2 = ['Sea'] + TEAM_COLS + SCORE_COLS + RES_COLS
 
 class ProbDataset(Dataset):
     def __init__(self, data, labels):
@@ -32,10 +40,10 @@ class ProbDataset(Dataset):
 
 
 class ProbPredictor(nn.Module):
-    def __init__(self):
+    def __init__(self, in_size):
         super(ProbPredictor, self).__init__()
-        self.layer_1 = nn.Linear(1, 10)
-        self.layer_2 = nn.Linear(10, 3)
+        self.layer_1 = nn.Linear(in_size, 32)
+        self.layer_2 = nn.Linear(32, 3)
         # self.softmax = F.log_softmax(nclass)
 
     def forward(self, x):
@@ -76,6 +84,9 @@ class League:
         self.teams: Dict[str, Team] = {}
         self.season: int = 0
         self.n_games: int = 0
+        self.data = pd.DataFrame(columns=LEAGUE_DATA)
+        self.data.Sea.astype('datetime64')
+        self.data.UFT.astype(bool)
 
     def add_team_if_missing(self, ident: str, team: Team = None):
         if ident in self.teams:
@@ -86,7 +97,7 @@ class League:
         self.teams[ident] = team
 
     def revise_pi_rating(self, hid, aid, hsc, asc, lr=0.1, gamma=0.3):
-        exp_dif = self.predict_match_outcome(hid, aid)
+        _, exp_dif = self.predict_match_outcome(hid, aid)
         real_dif = hsc - asc
         error = abs(real_dif - exp_dif)
         ps = psi(error)
@@ -109,15 +120,39 @@ class League:
         :param inc:
         :return: pregame expected goal difference and the outcome of the game
         """
+        if self.season != inc['Sea']:
+            # print('New Season league {}'.format(self.id))
+            # home_mean = self.data.HSC[self.data.Sea == self.season].mean()
+            # home_std = self.data.HSC[self.data.Sea == self.season].std()
+            # away_mean = self.data.ASC[self.data.Sea == self.season].mean()
+            # away_std = self.data.ASC[self.data.Sea == self.season].std()
+            # home_win_pct = self.data.H[self.data.Sea == self.season].mean()
+            # away_win_pct = self.data.A[self.data.Sea == self.season].mean()
+            # draw_pct = self.data.D[self.data.Sea == self.season].mean()
+            # if self.season != 0:
+            #     print(home_mean, home_std, away_mean, away_std, home_win_pct, away_win_pct, draw_pct)
+
+            self.season = inc['Sea']
+
         hid = inc['HID']
         aid = inc['AID']
+        self.add_team_if_missing(hid)
+        self.add_team_if_missing(aid)
+        self.data = self.data.append(inc[LEAGUE_DATA2])
+        self.data['H_HRTG'].iloc[-1] = self.teams[hid].R_home
+        self.data['H_ARTG'].iloc[-1] = self.teams[hid].R_away
+        self.data['A_HRTG'].iloc[-1] = self.teams[aid].R_home
+        self.data['A_ARTG'].iloc[-1] = self.teams[aid].R_away
         exp_gd = self.revise_pi_rating(hid, aid, inc['HSC'], inc['ASC'])
-        enough_games = self.teams[hid].n_games > 10 and self.teams[aid].n_games > 10
+        enough_games = self.teams[hid].n_games > PI_GAME_LIMIT and self.teams[aid].n_games > PI_GAME_LIMIT
         self.teams[hid].n_games += 1
         self.teams[aid].n_games += 1
         self.n_games += 1
-        r = inc[res_cols].values
+        r = inc[RES_COLS].values
         winner = (r * np.array([1, 0, 2])).sum()
+        self.data['EGD'].iloc[-1] = exp_gd
+        self.data['UFT'].iloc[-1] = enough_games
+
         return exp_gd, winner, enough_games
 
 
@@ -126,7 +161,8 @@ class League:
         self.add_team_if_missing(aid)
         h_team = self.teams[hid]
         a_team = self.teams[aid]
-        return h_team.expected_goal_diff(home=True) - a_team.expected_goal_diff(home=False)
+        enough_games = self.teams[hid].n_games > PI_GAME_LIMIT and self.teams[aid].n_games > PI_GAME_LIMIT
+        return enough_games, h_team.expected_goal_diff(home=True) - a_team.expected_goal_diff(home=False)
 
     def __str__(self):
         teams = list(self.teams.keys())
@@ -144,31 +180,34 @@ class Model:
         self.score_cols = ['HSC', 'ASC']
         self.team_cols = ['HID', 'AID']
         self.res_cols = ['H', 'D', 'A']
-        self.model: nn.Module = ProbPredictor()
+        self.model: nn.Module = ProbPredictor(len(MODEL_COL))
         self.train_data: List[List[float]] = []
         self.train = True
         self.diffs = []
+        self.placed_bets = [0]
+        self.bet_size = []
+        self.counter = 0
 
-    def train_predictor(self, data, labels, batch_size=32, lr=1e-3, m_epochs=10, plot=False) -> None:
+    def train_predictor(self, data, labels, batch_size=32, lr=1e-4, m_epochs=20, plot=False) -> None:
         dataset = ProbDataset(data, labels)
         train_len = int(len(dataset) * .7)
         train, test = random_split(dataset, [train_len, len(dataset) - train_len])
         train_loader = DataLoader(train, batch_size, shuffle=True)
         test_loader = DataLoader(test, batch_size, shuffle=True)
-        model = ProbPredictor()
+        model = ProbPredictor(data.shape[1])
         optimizer = optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
 
         epoch_loss = np.zeros(m_epochs)
         validation_loss = np.zeros(m_epochs)
         best_validation = float('inf')
-        model.to(device)
+        model.to(DEVICE)
         for epoch in range(m_epochs):
             avg_epoch = 0.
             model.train()
             for x, y in train_loader:
-                x = x.to(device)
-                y = y.to(device)
+                x = x.to(DEVICE)
+                y = y.to(DEVICE)
                 optimizer.zero_grad()
 
                 out = model(x)
@@ -184,8 +223,8 @@ class Model:
             avg_eval = 0.
             for x, y in test_loader:
                 with torch.no_grad():
-                    x = x.to(device)
-                    y = y.to(device)
+                    x = x.to(DEVICE)
+                    y = y.to(DEVICE)
                     out = model(x)
                     loss = criterion(out, y)
                     avg_eval += loss.item() / len(test_loader)
@@ -195,45 +234,69 @@ class Model:
                 best_validation = avg_eval
                 self.model = deepcopy(model)
 
-        # if plot:
-        #     plt.plot(epoch_loss)
-        #     plt.plot(validation_loss)
-        #     plt.legend(['train', 'validation'])
-        #     plt.show()
+        if plot:
+            # for name, param in best_model.named_parameters():
+            #     print(name, param)
+            try:
+                import matplotlib.pyplot as plt
+                plt.plot(epoch_loss)
+                plt.plot(validation_loss)
+                plt.legend(['train', 'validation'])
+                plt.show()
+            except Exception:
+                pass
+
 
     def update_bankroll(self, curr):
         self.bankroll.append(curr)
         self.bankroll_variance[0] = min(self.bankroll_variance[0], curr)
         self.bankroll_variance[1] = max(self.bankroll_variance[1], curr)
 
-    def predict_model(self, goal_diff):
-        inp = np.zeros((1, 1))
-        inp[0, 0] = goal_diff
+    def predict_model(self, goal_diff, home_team, away_team):
+        inp = np.zeros((1, len(MODEL_COL)))
+        inp[0, 0] = home_team.R_home
+        inp[0, 1] = home_team.R_away
+        inp[0, 2] = away_team.R_home
+        inp[0, 3] = away_team.R_away
+        inp[0, 4] = goal_diff
         inp = torch.tensor(inp, dtype=float)
-        inp.to(device)
+        inp.to(DEVICE)
         pred_prob = F.softmax(self.model(inp), dim=1).cpu().detach().numpy()
         return pred_prob[0, [1, 0, 2]]
 
-    def compute_bet(self, p_prob, b_prob, min_bet, max_bet):
+    def compute_bet(self, p_prob, b_prob, min_bet, max_bet, bet):
         diff = p_prob - b_prob
         dif_idx = np.argmax(diff)
         dif_max = np.max(diff)
         self.diffs.append(dif_max)
         if dif_max < 0.05:
             bet = 0
-        else:
-            bet = max(min_bet, min(max_bet, self.bankroll[-1] / 100))
         return bet, dif_idx
+
+    def _train(self):
+        league_data = []
+        for _, league in self.leagues.items():
+            league_data.append(league.data.loc[league.data['UFT'] == True])
+
+        df = pd.concat(league_data)
+        data = df[MODEL_COL].to_numpy().astype(float)
+        label = (df[RES_COLS].to_numpy() * np.array([1, 0, 2])).sum(axis=1).astype('int64')
+        self.train_predictor(data=data, labels=label, plot=True)
+        self.model.eval()
+        self.train = False
 
     def place_bets(self, opps: pd.DataFrame, summary: pd.DataFrame, inc: pd.DataFrame):
         self.update_data(inc)
-        if self.train:
-            data = np.array(self.train_data, dtype=float)
-            labels = np.array(data[:, 1], dtype=int)
-            data = data[:, 0].reshape(-1, 1)
-            self.train_predictor(data=data, labels=labels, plot=False)
-            self.model.eval()
-            self.train = False
+        self.counter += 1
+        if self.train or self.counter == 7000:
+            self._train()
+            print('TRAINING')
+            # data = np.array(self.train_data, dtype=float)
+            # labels = np.array(data[:, 1], dtype=int)
+            # data = data[:, 0].reshape(-1, 1)
+            # self.train_predictor(data=data, labels=labels, plot=False)
+            # self.model.eval()
+            # self.train = False
         _summary = summary.iloc[0].to_dict()
         self.update_bankroll(_summary['Bankroll'])
         min_bet = _summary['Min_bet']
@@ -242,17 +305,26 @@ class Model:
         today_games = opps[opps['Date'] == date]
         N = len(today_games)
         bets = np.zeros((N, 3))
+        placed_bets = 0
+        bet = max(min_bet, min(max_bet, self.bankroll[-1] / 100))
         for i in range(N):
             game = today_games.iloc[i]
-            if game['LID'] not in self.leagues or self.leagues[game['LID']].n_games < 1000:
+            if game['LID'] not in self.leagues:
                 continue
             league = self.leagues[game['LID']]
-            p_prob = self.predict_model(league.predict_match_outcome(game['HID'], game['AID']))
+            use, goal_dif = league.predict_match_outcome(game['HID'], game['AID'])
+            if not use:
+                continue
+            p_prob = self.predict_model(goal_dif, league.teams[game['HID']], league.teams[game['AID']])
             b_prob = odds2prob(game[self.odds_cols].to_numpy())
 
-            bet, idx = self.compute_bet(p_prob, b_prob, min_bet, max_bet)
+            bet, idx = self.compute_bet(p_prob, b_prob, min_bet, max_bet, bet)
+            if bet >= min_bet:
+                placed_bets += 1
             bets[i, idx] = bet
 
+        self.bet_size.append(bet)
+        self.placed_bets.append(placed_bets + self.placed_bets[-1])
         return pd.DataFrame(data=bets, columns=['BetH', 'BetD', 'BetA'], index=today_games.index)
 
     def update_data(self, inc: pd.DataFrame):
@@ -272,12 +344,15 @@ class Model:
 
     def print_leagues(self):
         print(self.bankroll_variance)
-        try:
-            import matplotlib.pyplot as plt
-            plt.plot(self.bankroll)
-            plt.show()
-            plt.hist(self.diffs)
-            plt.show()
-        except Exception:
-            pass
+        plot(self.bankroll)
+        plot(self.placed_bets)
+        plot(self.bet_size)
 
+
+def plot(data, title=''):
+    try:
+        import matplotlib.pyplot as plt
+        plt.plot(data)
+        plt.show()
+    except Exception:
+        pass
